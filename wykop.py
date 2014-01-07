@@ -283,7 +283,19 @@ class WykopAPI:
         return self.request('link', 'bury', [link_id, bury_id])
 
     def get_link_comments(self, link_id):
-        return self.request('link', 'comments', [link_id])
+        comments = self.request('link', 'comments', [link_id])
+        for comment in comments:
+            comment.reply = lambda body, embed=None:self.add_comment(link_id, comment.id, body, embed)
+        return comments
+
+
+    def get_link_comment_by_id(self, link_id, comment_id):
+        comments = self.get_link_comments(link_id)
+        for comment in comments:
+            if comment.id == comment_id:
+                comment.reply = lambda body, embed=None:self.add_comment(link_id, comment.id, body, embed)
+                return comment
+        return None
 
     def get_link_reports(self, link_id):
         return self.request('link', 'reports', [link_id])
@@ -328,7 +340,10 @@ class WykopAPI:
     # Profile
 
     def get_profile(self, username):
-        return self.request('profile', 'index', [username])
+        p = self.request('profile', 'index', [username])
+        p.send_message = lambda body: self.send_message(username, body)
+        p.name = p.login
+        return p
 
     def get_profile_links(self, username, page=1):
         api_params = {'appkey': self.appkey, 'page': page}
@@ -462,7 +477,19 @@ class WykopAPI:
     # Entries
 
     def get_entry(self, entry_id):
-        return self.request('entries', 'index', [entry_id])
+        req = self.request('entries', 'index', [entry_id])
+        req.reply = lambda msg:self.add_entry_comment(entry_id, msg)
+        return req
+
+    def get_entry_comment(self, entry_id, comment_id):
+        entry = self.get_entry(entry_id)
+        for entry_comment in entry.comments:
+            if entry_comment.id == comment_id:
+                entry_comment.reply = lambda msg:self.add_entry_comment(entry_id, msg)
+                return entry_comment
+
+        return None
+
 
     @login_required
     def add_entry(self, body, embed=None):
@@ -483,12 +510,23 @@ class WykopAPI:
         return self.request('entries', 'delete', [entry_id])
 
     @login_required
-    def add_entry_comment(self, entry_id, body, embed):
+    def add_entry_comment(self, entry_id, body, embed=None):
         post_params = {'body': body}
         if embed:
             post_params.update({'embed': embed})
         return self.request('entries', 'addcomment', [entry_id],
                             post_params=post_params)
+
+    def cls_add_entry_comment(self, body, embed=None):
+        post_params = {'body': body}
+        if embed:
+            post_params.update({'embed': embed})
+
+        entry_id = self.entry_id
+
+        return self.wykopapi.request('entries', 'addcomment', [entry_id],
+                            post_params=post_params)
+
 
     @login_required
     def edit_entry_comment(self, entry_id, comment_id, body):
@@ -569,6 +607,16 @@ class WykopAPI:
     def get_conversation(self, username):
         return self.request('pm', 'conversation', [username])
 
+    @login_required
+    def get_conversation_unread(self, username):
+        conv = self.get_conversation(username)
+        msgs_body = '\n'.join([msg.body for msg in conv if msg.status == 'new'])
+        msg = conv[-1]
+        msg['body'] = msgs_body if msgs_body else ''
+        import time, datetime
+        msg['id'] = int(time.mktime(datetime.datetime.strptime(msg.date, "%Y-%m-%d %H:%M:%S").timetuple()))
+        msg.reply = lambda body:self.send_message(username, body)
+        return msg
 
     @login_required
     def send_message(self, username, body, embed=None):
@@ -581,3 +629,72 @@ class WykopAPI:
     @login_required
     def delete_conversation(self, username):
         return self.request('pm', 'deleteconversation', [username])
+
+
+    # MyWykop
+
+    @login_required
+    def mywykop_index(self):
+        return self.request('mywykop', 'index')
+
+    @login_required
+    def notifications(self, page=1, types=None):
+        api_params = {'page': page}
+        notifications =  self.request('mywykop', 'notifications',
+                            api_params=api_params)
+
+        nts = []
+        for notification in notifications:
+            if types:
+                if notification.type in types:
+                    nts.append(notification)
+                else:
+                    continue
+
+            notification.mark_as_read = lambda id=notification.id:self.notification_mark_as_read(id)
+            if notification.type == 'entry_comment_directed':
+                notification['msg'] = self.get_entry_comment(notification.entry.id, notification.comment.id)
+                notification['msg']['permalink'] = notification['url']
+            elif notification.type == 'entry_directed':
+                notification['msg'] = self.get_entry(notification.entry.id)
+                notification['msg']['permalink'] = notification['url']
+            elif notification.type == 'link_comment_directed':
+                notification['msg'] = self.get_link_comment_by_id(notification.link.id, notification.comment.id)
+                notification['msg']['permalink'] = notification['url']
+            elif notification.type == 'pm':
+                notification['msg'] = self.get_conversation_unread(notification.author)
+                notification['msg']['permalink'] = 'http://www.wykop.pl/wiadomosc-prywatna/konwersacja/%s/' % notification['msg']['author']
+            else:
+                notification['msg'] = notification
+
+            notification['msg']['was_comment'] = notification.type != 'pm'
+            notification['msg']['author'] = self.get_profile(notification.author)
+            notification['msg']['mark_as_read'] = lambda x=None:notification.mark_as_read
+
+            self.simplify_body(notification['msg'])
+
+        return nts
+
+    @login_required
+    def get_unread_notifications(self, types=None):
+        i = 1
+        ret = []
+        while True:
+           new = [n for n in self.notifications(page=i, types=['entry_comment_directed', 'entry_directed', 'link_comment_directed', 'pm']) if n.new]
+           if len(new) == 0:
+               return ret
+           ret += new
+           i += 1
+
+    @login_required
+    def notifications_count(self, page=1):
+        return self.request('mywykop', 'notificationscount')['count']
+
+    @login_required
+    def notification_mark_as_read(self, notification_id):
+        return self.request('mywykop', 'markasreadnotification', [notification_id], raw_response=True)
+
+    def simplify_body(self, msg):
+        #@<a href="@bitcoinbot">bitcoinbot</a>: hi!'
+        import re
+        msg['body'] = re.sub('@<a href="(@[a-zA-Z0-9]+)">[a-zA-Z0-9]+</a>', '\g<1>', msg['body'])
